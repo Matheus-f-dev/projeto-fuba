@@ -1,0 +1,9 @@
+# Nunca enviar credenciais nem configuração local
+*-firebase-adminsdk-*.json
+serviceAccountKey*.json
+.env
+.env.local
+*.local
+node_modules
+dist
+*.log

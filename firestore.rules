@@ -1,0 +1,297 @@
+rules_version = '2';
+
+// Regras do painel operacional.
+//
+// Princípios:
+// - Sem perfil em /users ativo = sem acesso a nada.
+// - A organização do usuário vem do perfil, nunca do cliente: todo documento
+//   precisa ter organizationId igual ao do perfil.
+// - Transições de status espelham src/domain/status.ts. Altere os dois juntos.
+// - Datas de criação/alteração são do servidor (request.time), e o autor
+//   registrado (createdBy/changedBy) precisa ser o próprio usuário autenticado.
+// - Histórico, localização e comprovantes não podem ser apagados pelo cliente.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ——— Sessão ————————————————————————————————————————————————
+
+    function signedIn() { return request.auth != null; }
+    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function profile() { return get(profilePath()).data; }
+    function activeMember() {
+      return signedIn() && exists(profilePath()) && profile().status == 'ACTIVE';
+    }
+    function org() { return profile().organizationId; }
+    function isStaff() { return activeMember() && profile().role in ['ADMIN', 'OPERATOR']; }
+    function isAdmin() { return activeMember() && profile().role == 'ADMIN'; }
+
+    // ——— Auxiliares ————————————————————————————————————————————
+
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function changedKeys() { return incoming().diff(existing()).affectedKeys(); }
+    function unchanged(fields) { return !changedKeys().hasAny(fields); }
+    function isNow(value) { return value == request.time; }
+    function isMe(actor) { return actor is map && actor.uid == request.auth.uid; }
+
+    function readInOrg() { return isStaff() && existing().organizationId == org(); }
+    function createInOrg() {
+      return isStaff() && incoming().organizationId == org() && isNow(incoming().createdAt);
+    }
+    function updateInOrg() {
+      return isStaff()
+        && existing().organizationId == org()
+        && incoming().organizationId == existing().organizationId
+        && unchanged(['createdAt'])
+        && isNow(incoming().updatedAt);
+    }
+    function nonEmpty(value) { return value is string && value.size() > 0; }
+    function isDate(value) { return value is string && value.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function isCoord(lat, lng) {
+      return lat is number && lng is number && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+    }
+
+    // ——— Máquinas de estado ————————————————————————————————————
+
+    function orderTransitions() {
+      return {
+        'CREATED': ['PLANNED', 'ASSIGNED', 'CANCELLED'],
+        'PLANNED': ['ASSIGNED', 'CREATED'],
+        'ASSIGNED': ['IN_TRANSIT', 'CREATED'],
+        'IN_TRANSIT': ['DELIVERED', 'FAILED'],
+        'FAILED': ['CREATED', 'CANCELLED'],
+        'DELIVERED': [],
+        'CANCELLED': []
+      };
+    }
+    function routeTransitions() {
+      return {
+        'DRAFT': ['ASSIGNED', 'CANCELLED'],
+        'ASSIGNED': ['IN_PROGRESS', 'CANCELLED'],
+        'IN_PROGRESS': ['COMPLETED'],
+        'COMPLETED': [],
+        'CANCELLED': []
+      };
+    }
+    function stopTransitions() {
+      return {
+        'PENDING': ['ARRIVED', 'DELIVERED', 'FAILED'],
+        'ARRIVED': ['DELIVERED', 'FAILED'],
+        'DELIVERED': [],
+        'FAILED': []
+      };
+    }
+    function allowed(table, from, to) { return from == to || to in table[from]; }
+
+    // ——— Organização ———————————————————————————————————————————
+
+    match /organizations/{orgId} {
+      allow read: if activeMember() && org() == orgId;
+      // Criação apenas pelo script de provisionamento (Admin SDK).
+      allow create, delete: if false;
+      allow update: if activeMember() && org() == orgId && (
+        (isAdmin() && changedKeys().hasOnly(['name', 'document', 'updatedAt']) && nonEmpty(incoming().name))
+        // Contadores sequenciais: só avançam de 1 em 1, dentro da transação de criação
+        || (isStaff() && changedKeys().hasOnly(['orderSeq', 'updatedAt'])
+            && incoming().orderSeq == existing().orderSeq + 1)
+        || (isStaff() && changedKeys().hasOnly(['routeSeq', 'updatedAt'])
+            && incoming().routeSeq == existing().routeSeq + 1)
+      );
+    }
+
+    // ——— Usuários ——————————————————————————————————————————————
+
+    match /users/{uid} {
+      function validUser(d) {
+        return d.role in ['ADMIN', 'OPERATOR', 'DRIVER']
+          && d.status in ['ACTIVE', 'INACTIVE']
+          && nonEmpty(d.name) && nonEmpty(d.email);
+      }
+      allow read: if signedIn() && (request.auth.uid == uid || readInOrg());
+      allow create: if isAdmin() && incoming().organizationId == org()
+        && isNow(incoming().createdAt) && validUser(incoming());
+      allow update: if (
+          isAdmin() && existing().organizationId == org()
+          && unchanged(['organizationId', 'email', 'createdAt'])
+          && validUser(incoming())
+        ) || (
+          request.auth.uid == uid && activeMember()
+          && changedKeys().hasOnly(['name', 'phone', 'updatedAt'])
+        );
+      allow delete: if false;
+    }
+
+    // ——— Pedidos ———————————————————————————————————————————————
+
+    match /orders/{orderId} {
+      function validOrder(d) {
+        return d.status in ['CREATED', 'PLANNED', 'ASSIGNED', 'IN_TRANSIT', 'DELIVERED', 'FAILED', 'CANCELLED']
+          && nonEmpty(d.number)
+          && nonEmpty(d.recipient.name)
+          && d.address is map && nonEmpty(d.address.city)
+          && isDate(d.scheduledDate)
+          && d.attempts is int && d.attempts >= 0
+          && (d.location == null || isCoord(d.location.lat, d.location.lng));
+      }
+      // Pedido só vira ENTREGUE com comprovante gravado na mesma transação.
+      function deliveredWithProof() {
+        return existing().status == 'DELIVERED'
+          || incoming().status != 'DELIVERED'
+          || (incoming().proof is map
+              && existsAfter(/databases/$(database)/documents/deliveryProofs/$(incoming().proof.id)));
+      }
+
+      allow read: if readInOrg();
+      allow create: if createInOrg() && isNow(incoming().updatedAt)
+        && isMe(incoming().createdBy)
+        && incoming().status == 'CREATED'
+        && incoming().attempts == 0
+        && incoming().routeId == null
+        && incoming().proof == null
+        && validOrder(incoming());
+      allow update: if updateInOrg()
+        && unchanged(['number', 'createdBy'])
+        && allowed(orderTransitions(), existing().status, incoming().status)
+        && validOrder(incoming())
+        && deliveredWithProof();
+      allow delete: if false;
+    }
+
+    // ——— Rotas —————————————————————————————————————————————————
+
+    match /routes/{routeId} {
+      function validRoute(d) {
+        return d.status in ['DRAFT', 'ASSIGNED', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED']
+          && nonEmpty(d.code) && isDate(d.date)
+          && d.stopCount is int && d.stopCount >= 0 && d.stopCount <= 80
+          && d.deliveredCount is int && d.deliveredCount >= 0
+          && d.failedCount is int && d.failedCount >= 0
+          && d.deliveredCount + d.failedCount <= d.stopCount
+          // Fora do rascunho, a rota sempre tem motorista e veículo
+          && (d.status in ['DRAFT', 'CANCELLED'] || (nonEmpty(d.driverId) && nonEmpty(d.vehicleId)));
+      }
+      allow read: if readInOrg();
+      allow create: if createInOrg() && isNow(incoming().updatedAt)
+        && isMe(incoming().createdBy)
+        && incoming().status in ['DRAFT', 'ASSIGNED']
+        && incoming().deliveredCount == 0 && incoming().failedCount == 0
+        && validRoute(incoming());
+      allow update: if updateInOrg()
+        && unchanged(['code', 'createdBy'])
+        && allowed(routeTransitions(), existing().status, incoming().status)
+        && validRoute(incoming())
+        // Só conclui com todas as paradas resolvidas
+        && (incoming().status != 'COMPLETED' || existing().status == 'COMPLETED'
+            || incoming().deliveredCount + incoming().failedCount == incoming().stopCount);
+      allow delete: if false;
+    }
+
+    match /routeStops/{stopId} {
+      allow read: if readInOrg();
+      allow create: if createInOrg() && isNow(incoming().updatedAt)
+        && incoming().status == 'PENDING'
+        && incoming().sequence is int && incoming().sequence >= 1
+        && nonEmpty(incoming().routeId) && nonEmpty(incoming().orderId);
+      allow update: if updateInOrg()
+        && unchanged(['routeId', 'orderId'])
+        && allowed(stopTransitions(), existing().status, incoming().status)
+        && incoming().sequence is int && incoming().sequence >= 1;
+      // Remoção só de paradas ainda não executadas (rota antes de sair)
+      allow delete: if isStaff() && existing().organizationId == org() && existing().status == 'PENDING';
+    }
+
+    // ——— Recursos ——————————————————————————————————————————————
+
+    match /drivers/{driverId} {
+      function validDriver(d) {
+        return nonEmpty(d.name) && d.status in ['ACTIVE', 'INACTIVE'];
+      }
+      allow read: if readInOrg();
+      allow create: if createInOrg() && isNow(incoming().updatedAt)
+        && incoming().status == 'ACTIVE' && validDriver(incoming());
+      allow update: if updateInOrg() && validDriver(incoming());
+      allow delete: if false;
+    }
+
+    match /vehicles/{vehicleId} {
+      function validVehicle(d) {
+        return d.plate is string && d.plate.matches('^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$')
+          && nonEmpty(d.model)
+          && d.type in ['MOTO', 'CARRO', 'UTILITARIO', 'VAN', 'CAMINHAO']
+          && d.status in ['ACTIVE', 'INACTIVE'];
+      }
+      allow read: if readInOrg();
+      allow create: if createInOrg() && isNow(incoming().updatedAt)
+        && incoming().status == 'ACTIVE' && validVehicle(incoming());
+      allow update: if updateInOrg() && validVehicle(incoming());
+      allow delete: if false;
+    }
+
+    // ——— Execução ——————————————————————————————————————————————
+
+    match /deliveryProofs/{proofId} {
+      // Imagem em base64 no próprio documento: formato e tamanho limitados.
+      function validImage(d) {
+        return d.imageData == null || (
+          d.imageData is string
+          && d.imageData.size() <= 480000
+          && d.imageMimeType in ['image/jpeg', 'image/png', 'image/webp']
+          && d.imageData.matches('^data:image/(jpeg|png|webp);base64,.+')
+        );
+      }
+      allow read: if readInOrg();
+      allow create: if createInOrg()
+        && isMe(incoming().createdBy)
+        && nonEmpty(incoming().recipientName)
+        && nonEmpty(incoming().orderId)
+        && validImage(incoming());
+      // Após criado, só a foto muda: anexar quando não há, ou administrador remover.
+      allow update: if isStaff() && existing().organizationId == org()
+        && changedKeys().hasOnly(['imageData', 'imageMimeType', 'imageBytes'])
+        && validImage(incoming())
+        && ((existing().imageData == null && incoming().imageData is string)
+            || (isAdmin() && incoming().imageData == null));
+      allow delete: if false;
+    }
+
+    match /occurrences/{occurrenceId} {
+      allow read: if readInOrg();
+      allow create: if createInOrg()
+        && isMe(incoming().createdBy)
+        && incoming().status == 'OPEN'
+        && incoming().type in ['DESTINATARIO_AUSENTE', 'ENDERECO_NAO_LOCALIZADO', 'RECUSA_RECEBIMENTO', 'VEICULO_PROBLEMA', 'OUTRO']
+        && nonEmpty(incoming().description);
+      allow update: if isStaff() && existing().organizationId == org()
+        && existing().status == 'OPEN' && incoming().status == 'RESOLVED'
+        && changedKeys().hasOnly(['status', 'resolution', 'resolvedAt', 'resolvedBy'])
+        && isNow(incoming().resolvedAt) && isMe(incoming().resolvedBy)
+        && nonEmpty(incoming().resolution);
+      allow delete: if false;
+    }
+
+    match /statusHistory/{entryId} {
+      allow read: if readInOrg();
+      allow create: if createInOrg()
+        && isMe(incoming().changedBy)
+        && nonEmpty(incoming().event)
+        && nonEmpty(incoming().message);
+      allow update, delete: if false;
+    }
+
+    match /locationHistory/{pointId} {
+      function routeAfter() {
+        return getAfter(/databases/$(database)/documents/routes/$(incoming().routeId)).data;
+      }
+      allow read: if readInOrg();
+      // Localização só com rota em andamento da mesma organização.
+      allow create: if isStaff() && incoming().organizationId == org()
+        && isNow(incoming().recordedAt)
+        && isCoord(incoming().lat, incoming().lng)
+        && routeAfter().organizationId == org()
+        && routeAfter().status == 'IN_PROGRESS'
+        && routeAfter().driverId == incoming().driverId;
+      allow update, delete: if false;
+    }
+  }
+}
